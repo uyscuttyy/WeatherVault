@@ -1,0 +1,16 @@
+{
+  "transactions": [
+    {
+      "rpc": "https://coston2-api.flare.network/ext/C/rpc"
+    },
+    {
+      "rpc": "https://coston2-api.flare.network/ext/C/rpc"
+    },
+    {
+      "rpc": "https://coston2-api.flare.network/ext/C/rpc"
+    },
+    {
+      "rpc": "https://coston2-api.flare.network/ext/C/rpc"
+    }
+  ]
+}

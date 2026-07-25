@@ -1,0 +1,1 @@
+{"id":"8493cbc0621f9416","source_id_to_path":{"0":"src/WeatherVault.sol","1":"src/interfaces/IDataConnector.sol","2":"src/interfaces/ISettlementVerifier.sol","3":"src/interfaces/IWeatherOracle.sol","4":"src/mocks/MockDataConnector.sol","5":"src/mocks/MockSettlementVerifier.sol","6":"src/mocks/MockWeatherOracle.sol"},"language":"Solidity"}
