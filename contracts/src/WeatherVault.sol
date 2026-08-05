@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {IWeatherOracle} from "./interfaces/IWeatherOracle.sol";
-import {IDataConnector} from "./interfaces/IDataConnector.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ISettlementVerifier} from "./interfaces/ISettlementVerifier.sol";
+import {IWeb2Json} from "flare-periphery-0.1.37/src/coston2/IWeb2Json.sol";
+import {ContractRegistry} from "flare-periphery-0.1.37/src/coston2/ContractRegistry.sol";
 
 /// @title WeatherVault
-/// @notice Parametric weather insurance using two data sources and a TEE attestation.
+/// @notice Parametric weather insurance settled against a real Flare Data
+/// Connector (FDC) Web2Json attestation of external weather data, with
+/// premiums and payouts denominated in FXRP, plus a confidential-compute-
+/// style settlement approval.
 /// @dev Exact farm details remain off-chain; only a region hash is stored on-chain.
 contract WeatherVault {
     enum Parameter {
@@ -30,8 +34,20 @@ contract WeatherVault {
         Status status;
     }
 
-    IWeatherOracle public immutable weatherOracle;
-    IDataConnector public immutable dataConnector;
+    /// @notice Shape of the data we ask FDC's Web2Json attestors to return.
+    /// @dev Must exactly match the `abiSignature` used when the attestation
+    /// request was submitted off-chain, or decoding will revert or corrupt.
+    struct WeatherReading {
+        string region;
+        uint64 observedAt;
+        uint256 value;
+    }
+
+    /// @notice FXRP on Coston2 - a real FAsset representing XRP, 6 decimals.
+    /// @dev Looked up once at deploy time via ContractRegistry, never hardcoded
+    /// in advance, since the FAsset's underlying address can change.
+    IERC20 public immutable fxrp;
+
     ISettlementVerifier public immutable settlementVerifier;
 
     uint256 public nextPolicyId;
@@ -51,12 +67,7 @@ contract WeatherVault {
     event PoolFunded(address indexed funder, uint256 amount);
 
     event PayoutExecuted(
-        uint256 indexed policyId,
-        address indexed farmer,
-        uint256 payout,
-        uint256 weatherOracleReading,
-        uint256 dataConnectorReading,
-        uint8 riskTier
+        uint256 indexed policyId, address indexed farmer, uint256 payout, uint256 verifiedReading, uint8 riskTier
     );
 
     event PolicyExpired(uint256 indexed policyId, address indexed farmer);
@@ -66,46 +77,47 @@ contract WeatherVault {
     error PolicyAlreadyFinalized();
     error CoveragePeriodNotEnded();
     error ExpiryWindowNotReached();
-    error DataSourcesDisagree();
+    error InvalidWeatherProof();
+    error RegionMismatch();
+    error ReadingNotFreshEnough();
     error TriggerNotMet();
     error InvalidSettlementProof();
     error InsufficientPoolBalance();
     error TransferFailed();
 
-    constructor(
-        IWeatherOracle _weatherOracle,
-        IDataConnector _dataConnector,
-        ISettlementVerifier _settlementVerifier
-    ) {
-        weatherOracle = _weatherOracle;
-        dataConnector = _dataConnector;
+    constructor(IERC20 _fxrp, ISettlementVerifier _settlementVerifier) {
+        fxrp = _fxrp;
         settlementVerifier = _settlementVerifier;
     }
 
-    /// @notice Funds the insurance pool with test FLR for demo payouts.
-    function fundPool() external payable {
-        if (msg.value == 0) revert InvalidPolicy();
-        emit PoolFunded(msg.sender, msg.value);
+    /// @notice Funds the insurance pool with FXRP for demo payouts.
+    /// @dev Caller must have approved this contract for at least `amount` first.
+    function fundPool(uint256 amount) external {
+        if (amount == 0) revert InvalidPolicy();
+
+        bool sent = fxrp.transferFrom(msg.sender, address(this), amount);
+        if (!sent) revert TransferFailed();
+
+        emit PoolFunded(msg.sender, amount);
     }
 
-    /// @notice Creates a weather insurance policy.
-    /// @param regionHash Hash of a public preset region, not an exact farm location.
+    /// @notice Creates a weather insurance policy, paid in FXRP.
+    /// @dev Caller must have approved this contract for at least `premium` first.
+    /// @param regionHash keccak256 of the public region name string, not an exact farm location.
     /// @param parameter 0 = rainfall below threshold; 1 = temperature above threshold.
-    function createPolicy(
-        bytes32 regionHash,
-        uint8 parameter,
-        uint128 threshold,
-        uint64 coverageEnd
-    ) external payable returns (uint256 policyId) {
+    function createPolicy(bytes32 regionHash, uint8 parameter, uint128 threshold, uint64 coverageEnd, uint128 premium)
+        external
+        returns (uint256 policyId)
+    {
         if (
-            msg.value == 0 ||
-            regionHash == bytes32(0) ||
-            parameter > uint8(Parameter.TemperatureCentiCelsius) ||
-            threshold == 0 ||
-            coverageEnd <= block.timestamp
+            premium == 0 || regionHash == bytes32(0) || parameter > uint8(Parameter.TemperatureCentiCelsius)
+                || threshold == 0 || coverageEnd <= block.timestamp
         ) {
             revert InvalidPolicy();
         }
+
+        bool sent = fxrp.transferFrom(msg.sender, address(this), premium);
+        if (!sent) revert TransferFailed();
 
         policyId = nextPolicyId++;
 
@@ -114,89 +126,67 @@ contract WeatherVault {
             regionHash: regionHash,
             coverageEnd: coverageEnd,
             threshold: threshold,
-            premium: uint128(msg.value),
+            premium: premium,
             parameter: parameter,
             status: Status.Active
         });
 
-        emit PolicyCreated(
-            policyId,
-            msg.sender,
-            regionHash,
-            coverageEnd,
-            threshold,
-            uint128(msg.value),
-            parameter
-        );
+        emit PolicyCreated(policyId, msg.sender, regionHash, coverageEnd, threshold, premium, parameter);
     }
 
-    /// @notice Pays a triggered policy after both data sources agree and FCC approves.
+    /// @notice Pays a triggered policy once a real FDC-verified weather
+    /// reading confirms the threshold was breached, and the confidential
+    /// settlement layer approves. Payout is sent in FXRP.
     /// @dev Anyone may call this, so settlement does not rely on the farmer being online.
+    /// @param weatherProof Real Web2Json attestation proof from Flare's FDC.
+    /// @param teeProof Confidential-compute settlement approval (still mocked - Tier 3).
     function executePayout(
         uint256 policyId,
         uint8 riskTier,
+        IWeb2Json.Proof calldata weatherProof,
         bytes calldata teeProof
     ) external {
         Policy storage policy = _activePolicyAfterCoverage(policyId);
 
         if (riskTier > 3) revert InvalidPolicy();
 
-        uint256 oracleReading = weatherOracle.getWeatherReading(
-            policy.regionHash,
-            policy.parameter,
-            policy.coverageEnd
-        );
+        bool proven = ContractRegistry.getFdcVerification().verifyWeb2Json(weatherProof);
+        if (!proven) revert InvalidWeatherProof();
 
-        uint256 verifiedReading = dataConnector.getVerifiedWeatherReading(
-            policy.regionHash,
-            policy.parameter,
-            policy.coverageEnd
-        );
+        WeatherReading memory reading = abi.decode(weatherProof.data.responseBody.abiEncodedData, (WeatherReading));
 
-        if (oracleReading != verifiedReading) revert DataSourcesDisagree();
+        if (keccak256(bytes(reading.region)) != policy.regionHash) {
+            revert RegionMismatch();
+        }
 
-        bool triggered = _isTriggered(
-            policy.parameter,
-            oracleReading,
-            policy.threshold
-        );
+        if (reading.observedAt < policy.coverageEnd) {
+            revert ReadingNotFreshEnough();
+        }
+
+        bool triggered = _isTriggered(policy.parameter, reading.value, policy.threshold);
 
         if (!triggered) revert TriggerNotMet();
 
         bytes32 policyDigest = getPolicyDigest(policyId, riskTier);
 
-        if (
-            !settlementVerifier.verifySettlement(
-                policyDigest,
-                triggered,
-                riskTier,
-                teeProof
-            )
-        ) {
+        if (!settlementVerifier.verifySettlement(policyDigest, triggered, riskTier, teeProof)) {
             revert InvalidSettlementProof();
         }
 
         // Base cover is 120% of premium; higher FCC risk tiers add 10% each.
         uint256 payout = (uint256(policy.premium) * (120 + riskTier * 10)) / 100;
 
-        if (address(this).balance < payout) revert InsufficientPoolBalance();
+        if (fxrp.balanceOf(address(this)) < payout) revert InsufficientPoolBalance();
 
         policy.status = Status.Paid;
 
-        (bool sent, ) = policy.farmer.call{value: payout}("");
+        bool sent = fxrp.transfer(policy.farmer, payout);
         if (!sent) revert TransferFailed();
 
-        emit PayoutExecuted(
-            policyId,
-            policy.farmer,
-            payout,
-            oracleReading,
-            verifiedReading,
-            riskTier
-        );
+        emit PayoutExecuted(policyId, policy.farmer, payout, reading.value, riskTier);
     }
 
-    /// @notice Refunds a policy if settlement data never becomes available.
+    /// @notice Refunds a policy in FXRP if settlement data never becomes available.
     function claimExpired(uint256 policyId) external {
         Policy storage policy = policies[policyId];
 
@@ -208,17 +198,14 @@ contract WeatherVault {
 
         policy.status = Status.Expired;
 
-        (bool sent, ) = policy.farmer.call{value: policy.premium}("");
+        bool sent = fxrp.transfer(policy.farmer, policy.premium);
         if (!sent) revert TransferFailed();
 
         emit PolicyExpired(policyId, policy.farmer);
     }
 
     /// @notice Produces the exact digest the TEE mock must approve.
-    function getPolicyDigest(
-        uint256 policyId,
-        uint8 riskTier
-    ) public view returns (bytes32) {
+    function getPolicyDigest(uint256 policyId, uint8 riskTier) public view returns (bytes32) {
         Policy memory policy = policies[policyId];
 
         if (policy.farmer == address(0)) revert PolicyNotFound();
@@ -239,9 +226,7 @@ contract WeatherVault {
         );
     }
 
-    function _activePolicyAfterCoverage(
-        uint256 policyId
-    ) private view returns (Policy storage policy) {
+    function _activePolicyAfterCoverage(uint256 policyId) private view returns (Policy storage policy) {
         policy = policies[policyId];
 
         if (policy.farmer == address(0)) revert PolicyNotFound();
@@ -251,11 +236,7 @@ contract WeatherVault {
         }
     }
 
-    function _isTriggered(
-        uint8 parameter,
-        uint256 reading,
-        uint128 threshold
-    ) private pure returns (bool) {
+    function _isTriggered(uint8 parameter, uint256 reading, uint128 threshold) private pure returns (bool) {
         if (parameter == uint8(Parameter.RainfallMm)) {
             return reading < threshold;
         }

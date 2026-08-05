@@ -64,3 +64,6 @@ $ forge --help
 $ anvil --help
 $ cast --help
 ```
+
+ set -a source ../.env set +b
+forge script script/fdc/WeatherAttestation.s.sol:PrepareWeatherAttestationRequest --rpc-url $COSTON2_RPC_URL --ffi
